@@ -1,0 +1,133 @@
+#!/usr/bin/ksh
+#
+# Go ahead and ask... Why att_ksh? What is it?
+# It is AT&T's implementation of ksh. It is the /real/ ksh
+# Red Hat installed pdksh or some other clone and it
+# behaves differently. The problem that we are having is that
+# none of our systems behave consistently.
+# Instead of modifying the script for each different Linux system
+# I found it easier to manage by just using the att_ksh shell.
+#
+# If we set the outputType to PERCENTAGE this script will output
+# disk utilization based on percentage of the filesystem (i.e. 90% full).
+# It will also set exit codes based on the criticality of a filesystem.
+#
+# If you set the outputType to FILESYSTEM (or anything) the script will output
+# disk utilization based on KB used. It will always exit with an OK status.
+# This allows us to just collect information about the filesystems and not alert on them.
+# This is useful because we'll be running this script twice: passing it PERCENTAGE
+# as well as passing it FILESYSTEM.
+#
+defaultWarningLevel=90
+defaultCriticalLevel=95
+outputType="PERCENTAGE"
+
+confFile="/usr/lib/nagios/plugins/check_all_disks.conf"
+
+while getopts "w:c:f:t:" optionName
+do
+  case "$optionName" in
+    w)
+        tempWarningLevel=`echo "$OPTARG"|cut -d "%" -f1`
+        ;;
+    c)
+        tempCriticalLevel=`echo "$OPTARG"|cut -d "%" -f1`
+        ;;
+    f)
+        confFile=$OPTARG
+        ;;
+    t)
+        outputType=$OPTARG
+        ;;
+  esac
+done
+
+
+if [[ $tempWarningLevel < $tempCriticalLevel ]]
+then
+        defaultWarningLevel=$tempWarningLevel
+        defaultCriticalLevel=$tempCriticalLevel
+fi
+
+[[ ! -e $confFile ]] && echo "ALLDISK CRITICAL - no configuration file " && exit 2
+i=0
+grep -v ^# $confFile |while read MountPointList[i]
+do
+        ((i=i+1))
+done
+
+warn=0
+
+# Loop through live file system
+df -klP -x iso9660 |grep -v "Filesystem"|while read fs bk used avail capacity mount junk
+do
+  #let used=$used
+  warningLevel=$defaultWarningLevel
+  criticalLevel=$defaultCriticalLevel
+  # Loop through the array and look for a match
+  i=0
+  ignore=0
+  while ((i<${#MountPointList[@]}))
+  do
+        echo ${MountPointList[i]} | read fileMount fileAction fileWarn fileCrit fileJunk
+        if [[ $mount = $fileMount ]]
+        then
+          # We have a match. Let's dig further and look at the action flag
+          case $fileAction in
+                IGNORE)
+                        ignore=1
+                        break
+                        ;;
+                CHANGE)
+                        warningLevel=`echo "$fileWarn"|cut -d "%" -f1`
+                        criticalLevel=`echo "$fileCrit"|cut -d "%" -f1`
+                        ignore=0
+                        break
+                        ;;
+                *)
+                        ignore=0
+                        ;;
+          esac
+        fi
+        ((i=i+1))
+  done
+  if ((ignore))
+  then
+        s="noting"
+  else
+        capacity=`echo "$capacity"|cut -d "%" -f1`
+        case $outputType in
+        PERCENTAGE)
+                perfdata="$perfdata $mount=${capacity}%"
+                ;;
+        *)
+                perfdata="$perfdata $mount=${used}KB"
+                ;;
+        esac
+        if [[ $mount != "/proc" ]] && (( $capacity > $criticalLevel )) && [[ $outputType = "PERCENTAGE" ]]
+        then
+                # We stop all processing at this point. No reason to
+                # check any other filesystem.
+                echo "ALLDISK CRITICAL - $mount is $capacity% full"
+                exit 2
+        elif (( $capacity > $warningLevel )) && [[ $outputType = "PERCENTAGE" ]]
+        then
+                # We will set the exitMessage to WARNING but
+                # continue processing. We might have a critical
+                # somewhere in the list.
+                warnFSList="$warnFSList $mount is at $capacity%,"
+                warn=1
+        fi
+  fi
+done
+
+if (( ! warn ))
+then
+  # We don't have any warnings. Let's exit with an "OK" message.
+  echo "ALLDISK OK - Storage capacity for all filessytems are fine. |$perfdata"
+  exit 0
+else
+  # We have one or more warnings. Let's exit with the warning message.
+  echo "DISK WARNING - filesystem(s) getting full. $warnFSList |$perfdata"
+  exit 1
+fi
